@@ -1,0 +1,192 @@
+name: Development Deployment
+on:
+  push:
+    branches:
+      - dev
+
+env:
+  ACR_SERVER: ${{ secrets.RCAZRDEVTEC01_SERVER }}
+  ACR_USERNAME: ${{ secrets.RCAZRDEVTEC01_USERNAME }}
+  ACR_PASSWORD: ${{ secrets.RCAZRDEVTEC01_PASSWORD }}
+  AZURE_CREDENTIALS: ${{ secrets.RBAZRDEVDNAO01 }}
+  CLUSTER_NAME: kcazrdevtec01
+  RESOURCE_GROUP: cima_digital_dev
+  SLACK_WEBHOOK: ${{ secrets.MSGSENDER_WEBHOOK_SLACK }}
+
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout GitHub Action
+        uses: actions/checkout@main
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: |
+          npm i
+      - name: Run tests
+        run: |
+          npm run test:unit
+
+          
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+      package_name: ${{ steps.package.outputs.name }}
+      package_version: ${{ steps.package.outputs.version }}
+    steps: 
+
+      - name: Checkout GitHub Action
+        uses: actions/checkout@main
+
+      - name: readJsonOptions
+        id: jsonOptions
+        run: |
+          content=`cat ${{ github.workspace }}/deployment.json`
+          content="${content//'%'/'%25'}"
+          content="${content//$'\n'/'%0A'}"
+          content="${content//$'\r'/'%0D'}"
+          echo "::set-output name=deploymentJson::$content"
+
+      - name: Get package info
+        id: package
+        uses: codex-team/action-nodejs-package-info@v1
+
+      - name: Extract branch name
+        id: branch
+        run: |
+          echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
+
+      - name: Build image
+        run: |
+          docker build . -t ${{ env.ACR_SERVER }}/${{ steps.package.outputs.name }}-${{fromJson(steps.jsonOptions.outputs.deploymentJson).project}}-${{ steps.branch.outputs.branch }}:${{ steps.package.outputs.version }} -t ${{ env.ACR_SERVER }}/${{ steps.package.outputs.name }}-${{fromJson(steps.jsonOptions.outputs.deploymentJson).project}}-${{ steps.branch.outputs.branch }}:latest
+
+      - name: Docker login ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_SERVER }}
+          username: ${{ env.ACR_USERNAME }}
+          password: ${{ env.ACR_PASSWORD }}
+          
+      - name: Push image
+        run: |
+          docker push ${{ env.ACR_SERVER }}/${{ steps.package.outputs.name }}-${{fromJson(steps.jsonOptions.outputs.deploymentJson).project}}-${{ steps.branch.outputs.branch }} --all-tags
+          
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+    steps:
+
+      - name: Checkout GitHub Action
+        uses: actions/checkout@main
+
+      - name: readJsonOptions
+        id: jsonOptions
+        run: |
+          content=`cat ${{ github.workspace }}/deployment.json`
+          content="${content//'%'/'%25'}"
+          content="${content//$'\n'/'%0A'}"
+          content="${content//$'\r'/'%0D'}"
+          echo "::set-output name=deploymentJson::$content"
+
+      - name: Set context
+        uses: azure/aks-set-context@v1
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+      
+      - name: Extract ingress ip
+        id: ingress-ip
+        run: |
+          echo "::set-output name=ip::$(kubectl get services --namespace ingress-nginx ingress-nginx-controller --output jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+
+      - name: Generate url
+        id: url
+        run: |
+          if [ ${{fromJson(steps.jsonOptions.outputs.deploymentJson).devUrl}} == nip.io ]; then
+            echo "##[set-output name=url;]$(echo ${{fromJson(steps.jsonOptions.outputs.deploymentJson).project}}-${{ needs.build.outputs.branch }}.${{ steps.ingress-ip.outputs.ip }}.nip.io)"
+          else
+            echo "##[set-output name=url;]$(echo ${{fromJson(steps.jsonOptions.outputs.deploymentJson).devUrl}})"
+          fi
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ needs.build.outputs.branch }}-${{fromJson(steps.jsonOptions.outputs.deploymentJson).project}}  --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create deployment
+        run: |
+          cat ${{ github.workspace }}/manifests/deployment.yaml | sed "s/{{NAME}}/${{ needs.build.outputs.package_name }}/g;s/{{NAMESPACE}}/${{ needs.build.outputs.branch }}-${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }}/g;s/{{PROJECT}}/${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }}/g;s/{{BRANCH}}/${{ needs.build.outputs.branch }}/g;s/{{TAG}}/latest/g;s/{{ACR}}/${{ env.ACR_SERVER }}/g;s/{{PORT}}/${{fromJson(steps.jsonOptions.outputs.deploymentJson).port}}/g" | kubectl apply -f -
+
+      - name: Create service
+        run: |
+          cat ${{ github.workspace }}/manifests/service.yaml | sed "s/{{NAME}}/${{ needs.build.outputs.package_name }}/g;s/{{NAMESPACE}}/${{ needs.build.outputs.branch }}-${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }}/g;s/{{PORT}}/${{fromJson(steps.jsonOptions.outputs.deploymentJson).port}}/g" | kubectl apply -f -
+      
+      - name: Rollout Deploy
+        run: |-
+          kubectl rollout restart deployment ${{ needs.build.outputs.package_name }} -n ${{ needs.build.outputs.branch }}-${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }}
+          kubectl rollout status deployment ${{ needs.build.outputs.package_name }} -n ${{ needs.build.outputs.branch }}-${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }}
+
+  notifySuccess:
+    runs-on: ubuntu-latest
+    needs: [build, deploy]
+    steps:
+
+      - name: Checkout GitHub Action
+        uses: actions/checkout@main
+
+      - name: readJsonOptions
+        id: jsonOptions
+        run: |
+          content=`cat ${{ github.workspace }}/deployment.json`
+          content="${content//'%'/'%25'}"
+          content="${content//$'\n'/'%0A'}"
+          content="${content//$'\r'/'%0D'}"
+          echo "::set-output name=deploymentJson::$content"
+
+      - name: Success Slack Notification
+        if: ${{ fromJson(steps.jsonOptions.outputs.deploymentJson).notify }} == true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: general
+          SLACK_MESSAGE: 'Deployed to https://${{ needs.deploy.outputs.url }}'
+          SLACK_TITLE: Deployed ${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }} ${{ needs.build.outputs.package_name }} version ${{ needs.build.outputs.package_version }} to ${{ needs.build.outputs.branch }}
+          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK }}
+
+  notifyError:
+    runs-on: ubuntu-latest
+    if: ${{ always() && contains(join(needs.*.result, ','), 'failure') }}
+    needs: [build, deploy]
+    steps:
+
+      - name: Checkout GitHub Action
+        uses: actions/checkout@main
+
+      - name: readJsonOptions
+        id: jsonOptions
+        run: |
+          content=`cat ${{ github.workspace }}/deployment.json`
+          content="${content//'%'/'%25'}"
+          content="${content//$'\n'/'%0A'}"
+          content="${content//$'\r'/'%0D'}"
+          echo "::set-output name=deploymentJson::$content"
+
+      - name: Error Slack Notification
+        if: ${{ fromJson(steps.jsonOptions.outputs.deploymentJson).notify }} == true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: general
+          SLACK_MESSAGE: 'Test - ${{ needs.test.result }}, Build - ${{ needs.build.result }}, Deploy - ${{ needs.deploy.result }}'
+          SLACK_TITLE: Error on ${{ fromJson(steps.jsonOptions.outputs.deploymentJson).project }} deployemnt
+          SLACK_COLOR: failure
+          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK }}

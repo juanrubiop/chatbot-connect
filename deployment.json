@@ -1,0 +1,8 @@
+{
+    "project": "name",
+    "port": 80,
+    "devUrl": "nip.io",
+    "qaUrl": "nip.io",
+    "mainUrl": "nip.io",
+    "notify": "false"
+}
